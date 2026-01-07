@@ -1,0 +1,46 @@
+motor_pid_controller:
+  ros__parameters:
+    # Gains PID - Moteur A
+    motor_a:
+      Kp: 0.1560000
+      Ki: 0.53654
+      Kd: 0.011
+      integral_max: 150.0
+      output_max: 240.0
+      deadband_pwm: 15.0
+      error_deadzone: 2.0
+
+    # Gains PID - Moteur B
+    motor_b:
+      Kp: 0.156
+      Ki: 0.490
+      Kd: 0.0123
+      integral_max: 150.0
+      output_max: 240.0
+      deadband_pwm: 15.0
+      error_deadzone: 2.0
+
+    # Configuration matériel
+    hardware:
+      pwm_frequency: 100000
+      motor_a_dir_pin: 5
+      motor_a_en_pin: 12
+      motor_b_dir_pin: 6
+      motor_b_en_pin: 13
+
+    # Paramètres contrôle
+    control:
+      update_rate: 50
+      velocity_filter_alpha: 0.3
+
+    # Auto-tuning (sera utilisé dans Phase 5)
+    auto_tune:
+      Kp_start: 0.1
+      Kp_increment: 0.02
+      Kp_max: 2.0
+      test_duration_per_Kp: 10.0
+      settling_time: 2.0
+      min_cycles_required: 4
+      period_tolerance: 0.30
+      min_extremum_amplitude: 15.0
+      min_period: 0.3

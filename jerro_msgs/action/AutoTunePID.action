@@ -1,0 +1,32 @@
+# Goal: Start auto-tuning for one or both motors
+uint8 MOTOR_A = 1
+uint8 MOTOR_B = 2
+uint8 BOTH_MOTORS = 3
+
+uint8 motor_select      # Which motor(s) to tune
+float64 target_velocity # Target velocity for auto-tuning (ticks/sec)
+float64 max_duration    # Maximum duration in seconds (default: 120.0)
+---
+# Result: Tuning parameters found
+bool success
+string message
+
+# Motor A results
+float64 ku_a
+float64 tu_a
+float64 kp_a
+float64 ki_a
+float64 kd_a
+
+# Motor B results
+float64 ku_b
+float64 tu_b
+float64 kp_b
+float64 ki_b
+float64 kd_b
+---
+# Feedback: Progress updates during tuning
+string status           # Current status message
+float64 progress        # 0.0 to 1.0
+float64 current_kp      # Current Kp being tested
+uint8 current_motor     # Which motor is being tuned (1=A, 2=B)
