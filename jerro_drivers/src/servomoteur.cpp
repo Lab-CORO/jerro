@@ -1,90 +1,125 @@
 #include "rclcpp/rclcpp.hpp"
-
+#include <pigpiod_if2.h>
 #include <memory>
-#include <cstdlib>  // pour system()
 #include <iostream>
 #include "jerro_msgs/srv/set_servo_pos.hpp"
-#include "jerro_msgs/srv/toggle_servomotor.hpp"
 
+// Configuration servo
+const int SERVO_PIN = 25;           // GPIO 25 (broche 22)
+const int SERVO_MIN_PULSE = 1000;   // 1 ms (1000 µs) - position minimale
+const int SERVO_MAX_PULSE = 2000;   // 2 ms (2000 µs) - position maximale
+const int SERVO_CENTER_PULSE = 1500; // 1.5 ms - position centrale
+// Note: set_servo_pulsewidth generates ~50Hz PWM automatically
 
-void pwm_wheel_to_servo() {
-    system("gpio write 25 0");
-    system("gpio write 3 0");
-    system("gpio write 27 0");
-    system("gpio mode 1 pwm");
-    system("gpio pwmc 192");
-    system("gpio pwm-ms");
-}
-
-void pwm_servo_to_wheel() {
-    system("gpio write 25 0");
-    system("gpio write 3 0");
-    system("gpio write 27 0");
-    system("gpio pwm 1 0");
-    system("gpio mode 1 in");
-    system("gpio mode 26 pwm");
-    system("gpio mode 23 pwm");
-    system("gpio pwm-bal");
-    system("gpio pwm 26 512");
-    system("gpio pwm 23 512");
-    system("gpio write 25 1");
-    system("gpio write 3 1");
-    system("gpio write 27 1");
-}
-
-
-uint8_t state = jerro_msgs::srv::ToggleServomotor::Request::OFF;
-
-void set_servo_pos(const std::shared_ptr<jerro_msgs::srv::SetServoPos::Request> request,
-          std::shared_ptr<jerro_msgs::srv::SetServoPos::Response> response)
+class ServomoteurNode : public rclcpp::Node
 {
-    if(state == jerro_msgs::srv::ToggleServomotor::Request::ON){
-        int servo_pos = request->position;
-        std::string command = "gpio pwm 1 " + std::to_string(servo_pos);
-        system(command.c_str());
-        response->result = true;
-    }else{
-        response->result = false;
+public:
+    ServomoteurNode() : Node("servomoteur")
+    {
+        // Initialize pigpio
+        pi_ = pigpio_start(nullptr, nullptr);
+        if (pi_ < 0) {
+            RCLCPP_ERROR(this->get_logger(), "Failed to connect to pigpio daemon");
+            throw std::runtime_error("pigpio initialization failed");
+        }
+        RCLCPP_INFO(this->get_logger(), "Connected to pigpio daemon");
+
+        // Initialize servo at center position using set_servo_pulsewidth
+        // This function is specifically designed for servos and works on any GPIO
+        current_pulse_width_ = SERVO_CENTER_PULSE;
+        int ret = set_servo_pulsewidth(pi_, SERVO_PIN, current_pulse_width_);
+
+        if (ret == 0) {
+            RCLCPP_INFO(this->get_logger(), "Servo initialized on GPIO %d at %d µs (software PWM)",
+                       SERVO_PIN, current_pulse_width_);
+        } else {
+            RCLCPP_ERROR(this->get_logger(), "Failed to initialize servo (ret=%d)", ret);
+            throw std::runtime_error("servo initialization failed");
+        }
+
+        // Create ROS2 service
+        service_set_pos_ = this->create_service<jerro_msgs::srv::SetServoPos>(
+            "set_servo_pos",
+            std::bind(&ServomoteurNode::setServoPos, this,
+                     std::placeholders::_1, std::placeholders::_2));
+
+        RCLCPP_INFO(this->get_logger(), "Servomoteur node ready (GPIO 25, software PWM)");
+        RCLCPP_INFO(this->get_logger(), "Service: /set_servo_pos");
+        RCLCPP_INFO(this->get_logger(), "Position range: %d-%d µs", SERVO_MIN_PULSE, SERVO_MAX_PULSE);
     }
-    sleep(1);
 
-}
+    ~ServomoteurNode()
+    {
+        // Stop servo (pulsewidth=0 disables the servo)
+        set_servo_pulsewidth(pi_, SERVO_PIN, 0);
+        RCLCPP_INFO(this->get_logger(), "Servo stopped");
 
-void toggle_servomotor(const std::shared_ptr<jerro_msgs::srv::ToggleServomotor::Request> request,
-          std::shared_ptr<jerro_msgs::srv::ToggleServomotor::Response> response)
-{
-    if(request->state == jerro_msgs::srv::ToggleServomotor::Request::ON){
-        pwm_wheel_to_servo();
-        response->result = true;
-
-    }else if (request->state == jerro_msgs::srv::ToggleServomotor::Request::OFF){
-        pwm_servo_to_wheel();
-        response->result = true;
-    }else{
-        response->result = false;
+        // Close pigpio
+        if (pi_ >= 0) {
+            pigpio_stop(pi_);
+            RCLCPP_INFO(this->get_logger(), "Pigpio stopped");
+        }
     }
-    state = request->state;
-    sleep(1);
 
-}
+private:
+    int pi_;
+    int current_pulse_width_;  // Pulse width in microseconds (1000-2000)
 
+    rclcpp::Service<jerro_msgs::srv::SetServoPos>::SharedPtr service_set_pos_;
 
+    void setServoPulseWidth(int pulse_us)
+    {
+        // Clamp pulse width to valid range
+        if (pulse_us < SERVO_MIN_PULSE) pulse_us = SERVO_MIN_PULSE;
+        if (pulse_us > SERVO_MAX_PULSE) pulse_us = SERVO_MAX_PULSE;
+
+        current_pulse_width_ = pulse_us;
+
+        // set_servo_pulsewidth generates ~50Hz PWM signal automatically
+        int ret = set_servo_pulsewidth(pi_, SERVO_PIN, pulse_us);
+
+        if (ret == 0) {
+            RCLCPP_DEBUG(this->get_logger(), "Servo position: %d µs", pulse_us);
+        } else {
+            RCLCPP_ERROR(this->get_logger(), "Failed to set servo position (ret=%d)", ret);
+        }
+    }
+
+    // Service callback: Set servo position
+    // Request.position is in microseconds (1000-2000 µs)
+    void setServoPos(
+        const std::shared_ptr<jerro_msgs::srv::SetServoPos::Request> request,
+        std::shared_ptr<jerro_msgs::srv::SetServoPos::Response> response)
+    {
+        int pulse_us = request->position;
+
+        // Validate range
+        if (pulse_us < SERVO_MIN_PULSE || pulse_us > SERVO_MAX_PULSE) {
+            RCLCPP_WARN(this->get_logger(),
+                       "Invalid servo position %d µs (valid: %d-%d µs)",
+                       pulse_us, SERVO_MIN_PULSE, SERVO_MAX_PULSE);
+            response->result = false;
+        } else {
+            setServoPulseWidth(pulse_us);
+            response->result = true;
+            RCLCPP_INFO(this->get_logger(), "Servo moved to %d µs", pulse_us);
+        }
+    }
+};
 
 int main(int argc, char **argv)
 {
-  rclcpp::init(argc, argv);
+    rclcpp::init(argc, argv);
 
-  std::shared_ptr<rclcpp::Node> node = rclcpp::Node::make_shared("servomoteur");
+    try {
+        auto node = std::make_shared<ServomoteurNode>();
+        rclcpp::spin(node);
+    } catch (const std::exception& e) {
+        RCLCPP_ERROR(rclcpp::get_logger("rclcpp"), "Exception: %s", e.what());
+        rclcpp::shutdown();
+        return 1;
+    }
 
-  rclcpp::Service<jerro_msgs::srv::SetServoPos>::SharedPtr service_set_pos =
-    node->create_service<jerro_msgs::srv::SetServoPos>("set_servo_pos", &set_servo_pos);
-
-  rclcpp::Service<jerro_msgs::srv::ToggleServomotor>::SharedPtr service_state_motor =
-    node->create_service<jerro_msgs::srv::ToggleServomotor>("toggle_servomotor", &toggle_servomotor);
-
-
-  RCLCPP_INFO(rclcpp::get_logger("rclcpp"), "Ready move servo.");
-
-  rclcpp::spin(node);
-  rclcpp::shutdown();
+    rclcpp::shutdown();
+    return 0;
 }

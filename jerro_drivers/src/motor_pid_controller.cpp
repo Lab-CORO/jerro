@@ -48,10 +48,6 @@ public:
             "/motor/motor_RT_cmd", 10,
             std::bind(&MotorPIDController::motorRTCmdCallback, this, std::placeholders::_1));
 
-        // Create publisher for wheel velocities
-        pub_wheel_velocity_ = this->create_publisher<jerro_msgs::msg::MotorSpeed>(
-            "/motor/wheel_velocity", 10);
-
         // Create control timer (50Hz)
         control_timer_ = this->create_wall_timer(
             20ms, std::bind(&MotorPIDController::controlTimerCallback, this));
@@ -68,7 +64,6 @@ public:
         RCLCPP_INFO(this->get_logger(), "  - PID mode: /motor/set_speed (velocity in ticks/sec, range: 0-2500)");
         RCLCPP_INFO(this->get_logger(), "  - Direct mode: /motor/motor_RT_cmd (PWM values -200 to +200)");
         RCLCPP_INFO(this->get_logger(), "  - Auto-tune action: /motor/auto_tune");
-        RCLCPP_INFO(this->get_logger(), "  - Wheel velocity publisher: /motor/wheel_velocity (ticks/sec)");
         RCLCPP_INFO(this->get_logger(), "  - Encoder resolution: 158.2 PPR (632.8 ticks/rev in quadrature)");
     }
 
@@ -138,7 +133,6 @@ private:
     rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr sub_encoder_b_;
     rclcpp::Subscription<jerro_msgs::msg::MotorSpeed>::SharedPtr sub_motor_speed_;
     rclcpp::Subscription<jerro_msgs::msg::MotorSpeed>::SharedPtr sub_motor_rt_cmd_;
-    rclcpp::Publisher<jerro_msgs::msg::MotorSpeed>::SharedPtr pub_wheel_velocity_;
     rclcpp::TimerBase::SharedPtr control_timer_;
     rclcpp_action::Server<AutoTunePID>::SharedPtr action_server_;
 
@@ -337,12 +331,6 @@ private:
         // Filter velocities
         float velocity_a = filter_a_.update(velocity_raw_a);
         float velocity_b = filter_b_.update(velocity_raw_b);
-
-        // Publish wheel velocities (always, for both modes)
-        auto velocity_msg = jerro_msgs::msg::MotorSpeed();
-        velocity_msg.motor_speed_a = velocity_a;
-        velocity_msg.motor_speed_b = velocity_b;
-        pub_wheel_velocity_->publish(velocity_msg);
 
         // Direct PWM mode - apply commands directly without PID
         if (!pid_mode_) {

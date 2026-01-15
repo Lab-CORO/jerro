@@ -1,6 +1,7 @@
 /*
     MPU6050 Interfacing with Raspberry Pi - ROS2 Version
     Adapted from ROS1 code by jproberge (January 2022)
+    Modified to use pigpio instead of wiringPi
 */
 
 #include <chrono>
@@ -8,10 +9,10 @@
 #include <cstdlib>
 #include <cstdio>
 #include <memory>
+#include <thread>
 
-// WiringPi includes
-#include <wiringPiI2C.h>
-#include <wiringPi.h>
+// pigpio includes
+#include <pigpiod_if2.h>
 
 // ROS2 includes
 #include "rclcpp/rclcpp.hpp"
@@ -26,6 +27,7 @@
 
 // Macros and constants
 #define Device_Address 0x68   /* Device Address/Identifier for MPU6050 */
+const int I2C_Bus = 1;        /* I2C bus number (usually 1 on RPi) */
 const int MPU6050_GndPin = 4;
 
 #define PWR_MGMT_1   0x6B
@@ -56,7 +58,9 @@ public:
                   norm_bias_(0.0),
                   ax_mean_(0.0), ay_mean_(0.0), az_mean_(0.0),
                   acc_coeff_(0.0),
-                  gx_bias_(0.0), gy_bias_(0.0), gz_bias_(0.0)
+                  gx_bias_(0.0), gy_bias_(0.0), gz_bias_(0.0),
+                  pi_(-1),
+                  i2c_handle_(-1)
   {
     // Create publishers and subscribers
     imu_pub_ = this->create_publisher<sensor_msgs::msg::Imu>("imu/data_raw", 1);
@@ -71,12 +75,28 @@ public:
     // Create a Transform Broadcaster
     tf_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>(this);
 
-    // Initialize wiringPi and MPU6050 hardware
-    fd_ = wiringPiI2CSetup(Device_Address);
-    wiringPiSetupGpio();
-    pinMode(MPU6050_GndPin, OUTPUT);
-    digitalWrite(MPU6050_GndPin, LOW);
-    delay(200);  // allow time for sensor power-up
+    // Initialize pigpio and MPU6050 hardware
+    pi_ = pigpio_start(nullptr, nullptr);
+    if (pi_ < 0) {
+      RCLCPP_ERROR(this->get_logger(), "Failed to connect to pigpio daemon");
+      throw std::runtime_error("pigpio initialization failed");
+    }
+    RCLCPP_INFO(this->get_logger(), "Connected to pigpio daemon");
+
+    // Configure GPIO for MPU6050 ground pin
+    set_mode(pi_, MPU6050_GndPin, PI_OUTPUT);
+    gpio_write(pi_, MPU6050_GndPin, 0);  // LOW
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));  // allow time for sensor power-up
+
+    // Open I2C connection to MPU6050
+    i2c_handle_ = i2c_open(pi_, I2C_Bus, Device_Address, 0);
+    if (i2c_handle_ < 0) {
+      RCLCPP_ERROR(this->get_logger(), "Failed to open I2C connection to MPU6050 (ret=%d)", i2c_handle_);
+      pigpio_stop(pi_);
+      throw std::runtime_error("I2C initialization failed");
+    }
+    RCLCPP_INFO(this->get_logger(), "I2C connection to MPU6050 established");
+
     MPU6050_Init();
 
     // Initialize a transform stamp (for broadcasting)
@@ -86,8 +106,23 @@ public:
     transform_stamped_.transform.translation.y = 0.0;
     transform_stamped_.transform.translation.z = 0.0;
 
-    // Start a timer to run at 100Hz
+    // Start a timer to run at 20Hz (50ms)
     timer_ = this->create_wall_timer(50ms, std::bind(&MPU6050Node::timer_callback, this));
+
+    RCLCPP_INFO(this->get_logger(), "MPU6050 node initialized (pigpio I2C)");
+  }
+
+  ~MPU6050Node()
+  {
+    // Close I2C and pigpio
+    if (i2c_handle_ >= 0) {
+      i2c_close(pi_, i2c_handle_);
+      RCLCPP_INFO(this->get_logger(), "I2C connection closed");
+    }
+    if (pi_ >= 0) {
+      pigpio_stop(pi_);
+      RCLCPP_INFO(this->get_logger(), "Pigpio stopped");
+    }
   }
 
 private:
@@ -118,25 +153,34 @@ private:
   double ax_mean_, ay_mean_, az_mean_, acc_coeff_;
   double gx_bias_, gy_bias_, gz_bias_;
 
-  // I2C file descriptor
-  int fd_;
+  // pigpio and I2C handles
+  int pi_;
+  int i2c_handle_;
 
   // Initialize MPU6050 registers
   void MPU6050_Init()
   {
-    wiringPiI2CWriteReg8(fd_, SMPLRT_DIV, 0x07);    // Sample rate register
-    wiringPiI2CWriteReg8(fd_, PWR_MGMT_1, 0x01);      // Power management register
-    wiringPiI2CWriteReg8(fd_, CONFIG, 0);             // Configuration register
-    wiringPiI2CWriteReg8(fd_, ACCEL_CONFIG, 0x00);    // Accel Configuration register
-    wiringPiI2CWriteReg8(fd_, GYRO_CONFIG, 0x00);     // Gyro Configuration register
-    wiringPiI2CWriteReg8(fd_, INT_ENABLE, 0x01);      // Interrupt enable register
+    i2c_write_byte_data(pi_, i2c_handle_, SMPLRT_DIV, 0x07);    // Sample rate register
+    i2c_write_byte_data(pi_, i2c_handle_, PWR_MGMT_1, 0x01);    // Power management register
+    i2c_write_byte_data(pi_, i2c_handle_, CONFIG, 0);           // Configuration register
+    i2c_write_byte_data(pi_, i2c_handle_, ACCEL_CONFIG, 0x00);  // Accel Configuration register
+    i2c_write_byte_data(pi_, i2c_handle_, GYRO_CONFIG, 0x00);   // Gyro Configuration register
+    i2c_write_byte_data(pi_, i2c_handle_, INT_ENABLE, 0x01);    // Interrupt enable register
+    RCLCPP_INFO(this->get_logger(), "MPU6050 registers initialized");
   }
 
   // Read two bytes from a register and combine into a short
   short read_raw_data(int addr)
   {
-    short high_byte = wiringPiI2CReadReg8(fd_, addr);
-    short low_byte = wiringPiI2CReadReg8(fd_, addr + 1);
+    int high_byte = i2c_read_byte_data(pi_, i2c_handle_, addr);
+    int low_byte = i2c_read_byte_data(pi_, i2c_handle_, addr + 1);
+
+    if (high_byte < 0 || low_byte < 0) {
+      RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                           "Failed to read I2C data from register 0x%02X", addr);
+      return 0;
+    }
+
     short value = (high_byte << 8) | low_byte;
     return value;
   }
@@ -206,7 +250,7 @@ private:
     yaw_bias_ += yaw - yaw2;
   }
 
-  // Timer callback executed at 100 Hz
+  // Timer callback executed at 20 Hz
   void timer_callback()
   {
     // Bias calculation phase
@@ -279,8 +323,6 @@ private:
         // Update and broadcast transform (using the latest transform_stamped_)
         transform_stamped_.header.stamp = this->now();
         tf_broadcaster_->sendTransform(transform_stamped_);
-      } else {
-        // RCLCPP_INFO(this->get_logger(), "Waiting for filtered IMU data...");
       }
     }
   }
@@ -289,8 +331,16 @@ private:
 int main(int argc, char ** argv)
 {
   rclcpp::init(argc, argv);
-  auto node = std::make_shared<MPU6050Node>();
-  rclcpp::spin(node);
+
+  try {
+    auto node = std::make_shared<MPU6050Node>();
+    rclcpp::spin(node);
+  } catch (const std::exception& e) {
+    RCLCPP_ERROR(rclcpp::get_logger("rclcpp"), "Exception: %s", e.what());
+    rclcpp::shutdown();
+    return 1;
+  }
+
   rclcpp::shutdown();
   return 0;
 }

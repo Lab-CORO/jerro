@@ -31,18 +31,7 @@ endif()
 
 SET(CMAKE_CXX_FLAGS "-fpermissive")
 
-# Ajouter l'exécutable encodeurs
-add_executable(encodeurs src/RED.cpp src/test_RED_dual.cpp)
-ament_target_dependencies(encodeurs rclcpp std_msgs jerro_msgs)
-
-target_link_libraries(encodeurs
-  ${PIGPIO_LIB}
-  pthread
-  pigpiod_if2
-  rt
-)
-install(TARGETS encodeurs
-  DESTINATION lib/${PROJECT_NAME})
+# Encodeurs node removed - replaced by encoder_publisher
 
 
 # central inertielle
@@ -57,7 +46,10 @@ ament_target_dependencies(centrale_inertielle
     jerro_msgs
 )
 target_link_libraries(centrale_inertielle
-  wiringPi
+  ${PIGPIO_LIB}
+  pthread
+  pigpiod_if2
+  rt
 )
 install(TARGETS centrale_inertielle
   DESTINATION lib/${PROJECT_NAME})
@@ -66,7 +58,12 @@ install(TARGETS centrale_inertielle
 
 add_executable(servomotor src/servomoteur.cpp)
 ament_target_dependencies(servomotor rclcpp jerro_msgs)
-
+target_link_libraries(servomotor
+  ${PIGPIO_LIB}
+  pthread
+  pigpiod_if2
+  rt
+)
 install(TARGETS
     servomotor
   DESTINATION lib/${PROJECT_NAME})
