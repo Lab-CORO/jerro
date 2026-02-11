@@ -57,7 +57,7 @@ install(TARGETS centrale_inertielle
 
 
 add_executable(servomotor src/servomoteur.cpp)
-ament_target_dependencies(servomotor rclcpp jerro_msgs)
+ament_target_dependencies(servomotor rclcpp jerro_msgs sensor_msgs)
 target_link_libraries(servomotor
   ${PIGPIO_LIB}
   pthread

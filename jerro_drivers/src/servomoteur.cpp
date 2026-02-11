@@ -3,6 +3,7 @@
 #include <memory>
 #include <iostream>
 #include "jerro_msgs/srv/set_servo_pos.hpp"
+#include "sensor_msgs/msg/joint_state.hpp"
 
 // Configuration servo
 const int SERVO_PIN = 25;           // GPIO 25 (broche 22)
@@ -10,6 +11,11 @@ const int SERVO_MIN_PULSE = 1000;   // 1 ms (1000 µs) - position minimale
 const int SERVO_MAX_PULSE = 2000;   // 2 ms (2000 µs) - position maximale
 const int SERVO_CENTER_PULSE = 1500; // 1.5 ms - position centrale
 // Note: set_servo_pulsewidth generates ~50Hz PWM automatically
+
+// Conversion pulse (µs) -> angle (rad) pour le joint
+const double SERVO_START_ANGLE = 0.623334;       // Angle (rad) a SERVO_MAX_PULSE
+const double SERVO_INC_PER_US  = -0.001558335;   // Radian par microseconde
+const std::string JOINT_NAME   = "base_link_to_servomotor";
 
 class ServomoteurNode : public rclcpp::Node
 {
@@ -36,6 +42,11 @@ public:
             RCLCPP_ERROR(this->get_logger(), "Failed to initialize servo (ret=%d)", ret);
             throw std::runtime_error("servo initialization failed");
         }
+
+        // Create JointState publisher
+        joint_state_pub_ = this->create_publisher<sensor_msgs::msg::JointState>(
+            "/set_joint_states", 10);
+        publishJointState();
 
         // Create ROS2 service
         service_set_pos_ = this->create_service<jerro_msgs::srv::SetServoPos>(
@@ -66,6 +77,19 @@ private:
     int current_pulse_width_;  // Pulse width in microseconds (1000-2000)
 
     rclcpp::Service<jerro_msgs::srv::SetServoPos>::SharedPtr service_set_pos_;
+    rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr joint_state_pub_;
+
+    void publishJointState()
+    {
+        double angle = SERVO_START_ANGLE
+            + (SERVO_MAX_PULSE - current_pulse_width_) * SERVO_INC_PER_US;
+
+        sensor_msgs::msg::JointState msg;
+        msg.header.stamp = this->get_clock()->now();
+        msg.name.push_back(JOINT_NAME);
+        msg.position.push_back(angle);
+        joint_state_pub_->publish(msg);
+    }
 
     void setServoPulseWidth(int pulse_us)
     {
@@ -80,6 +104,7 @@ private:
 
         if (ret == 0) {
             RCLCPP_DEBUG(this->get_logger(), "Servo position: %d µs", pulse_us);
+            publishJointState();
         } else {
             RCLCPP_ERROR(this->get_logger(), "Failed to set servo position (ret=%d)", ret);
         }
