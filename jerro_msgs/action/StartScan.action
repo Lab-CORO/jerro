@@ -1,6 +1,7 @@
 # The goal definition (equivalent to the service request)
 bool start
 bool enable_filtering
+bool enable_crop
 float32 crop_x_min
 float32 crop_x_max
 float32 crop_y_min
@@ -8,7 +9,8 @@ float32 crop_y_max
 float32 crop_z_min
 float32 crop_z_max
 bool enable_statistical_filter
-bool statistical_std_ratio
+float32 statistical_std_ratio
+int32 statistical_nb_neighbors
 bool enable_voxel_downsampling
 float32 voxel_size
 ---
