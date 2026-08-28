@@ -4,14 +4,21 @@
 #include <jerro_msgs/msg/motor_speed.hpp>
 #include <jerro_msgs/action/auto_tune_pid.hpp>
 #include <pigpiod_if2.h>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
+#include <cstdio>
 #include <fstream>
 #include <iomanip>
+#include <string>
+#include <thread>
 
 #include "jerro_drivers/pid_controller.hpp"
 #include "jerro_drivers/exponential_filter.hpp"
 #include "jerro_drivers/oscillation_detector.hpp"
+#include "jerro_drivers/relay_tuner.hpp"
+#include "jerro_drivers/velocity_estimator.hpp"
 
 using namespace std::chrono_literals;
 
@@ -30,6 +37,8 @@ public:
 
         // Load parameters
         loadParameters();
+
+        node_start_time_ = std::chrono::steady_clock::now();
 
         // Create subscribers
         sub_encoder_a_ = this->create_subscription<std_msgs::msg::Int32>(
@@ -61,10 +70,14 @@ public:
             std::bind(&MotorPIDController::handleAccepted, this, std::placeholders::_1));
 
         RCLCPP_INFO(this->get_logger(), "Motor PID controller initialized");
-        RCLCPP_INFO(this->get_logger(), "  - PID mode: /motor/set_speed (velocity in ticks/sec, range: 0-2500)");
+        RCLCPP_INFO(this->get_logger(),
+            "  - PID mode: /motor/set_speed (velocity in ticks/sec, range: 0-%.0f)",
+            rpmToTicks(max_rpm_));
         RCLCPP_INFO(this->get_logger(), "  - Direct mode: /motor/motor_RT_cmd (PWM values -200 to +200)");
         RCLCPP_INFO(this->get_logger(), "  - Auto-tune action: /motor/auto_tune");
-        RCLCPP_INFO(this->get_logger(), "  - Encoder resolution: 158.2 PPR (632.8 ticks/rev in quadrature)");
+        RCLCPP_INFO(this->get_logger(),
+            "  - Encoder resolution: %.1f ticks/rev (quadrature), vitesse max %.0f RPM = %.0f ticks/s",
+            ticks_per_revolution_, max_rpm_, rpmToTicks(max_rpm_));
     }
 
     ~MotorPIDController()
@@ -99,6 +112,18 @@ private:
     // Encoder feedback
     std::atomic<int> encoder_a_count_{0};
     std::atomic<int> encoder_b_count_{0};
+
+    // Sequence et horodatage d'arrivee de chaque message encodeur.
+    // /encoder_a et /encoder_b sont publies a 50 Hz. Echantillonner le compteur
+    // plus vite que ca renvoie plusieurs fois la MEME valeur, et l'estimateur de
+    // vitesse calcule alors des fenetres incoherentes : c'est de l'aliasing, qui
+    // se manifeste comme un bruit de mesure enorme (sigma comparable a la
+    // moyenne). Les boucles d'identification ne consomment donc qu'un echantillon
+    // par message, horodate a son arrivee reelle plutot qu'au moment du sondage.
+    std::atomic<uint32_t> encoder_a_seq_{0};
+    std::atomic<uint32_t> encoder_b_seq_{0};
+    std::atomic<int64_t> encoder_a_stamp_ns_{0};
+    std::atomic<int64_t> encoder_b_stamp_ns_{0};
     int last_encoder_a_ = 0;
     int last_encoder_b_ = 0;
 
@@ -117,9 +142,19 @@ private:
     ExponentialFilter filter_a_;
     ExponentialFilter filter_b_;
 
+    // Velocity estimation (fenetre adaptative, robuste a basse vitesse)
+    VelocityEstimator vel_est_a_;
+    VelocityEstimator vel_est_b_;
+
     // Timing
     std::chrono::steady_clock::time_point last_time_;
+    std::chrono::steady_clock::time_point node_start_time_;
     bool first_run_ = true;
+
+    // Auto-tuning: la boucle de controle 50 Hz doit se taire pendant qu'un
+    // tuning est en cours, sinon elle ecrit PWM=0 et reset() sur le moteur et le
+    // PID en cours d'identification, toutes les 20 ms.
+    std::atomic<bool> tuning_active_{false};
 
     // Auto-tuning parameters
     float Kp_start_ = 0.05f;
@@ -127,6 +162,45 @@ private:
     float Kp_max_ = 2.0f;
     float test_duration_per_Kp_ = 8.0f;
     float settling_time_ = 2.0f;
+    std::string tune_method_ = "relay";
+    ZNVariant zn_variant_ = ZNVariant::NO_OVERSHOOT;
+    std::string gains_output_path_;
+    float encoder_check_pwm_ = 60.0f;
+
+    // Resolution de l'encodeur. Ne sert pas au calcul de la commande (tout est en
+    // ticks/s), mais permet de deriver les bornes de consigne et d'afficher les
+    // vitesses en RPM, lisibles par un humain.
+    float ticks_per_revolution_ = 1980.0f;
+    float max_rpm_ = 30.0f;
+    float min_target_rpm_ = 8.0f;
+
+    // Detecteur d'oscillation (chemin 'sweep')
+    OscillationDetector detector_template_;
+
+    // Relais (chemin 'relay')
+    RelayTuner relay_template_;
+
+    // Garde RAII : garantit que la boucle de controle est rendue au mode normal
+    // sur TOUS les chemins de sortie (succes, abort, cancel, exception).
+    struct TuningGuard {
+        MotorPIDController* self;
+        explicit TuningGuard(MotorPIDController* s) : self(s) {
+            self->tuning_active_ = true;
+        }
+        ~TuningGuard() {
+            self->haltMotors();
+            self->target_velocity_a_ = 0.0f;
+            self->target_velocity_b_ = 0.0f;
+            self->pid_motor_a_.reset();
+            self->pid_motor_b_.reset();
+            self->filter_a_.reset();
+            self->filter_b_.reset();
+            self->vel_est_a_.reset();
+            self->vel_est_b_.reset();
+            self->first_run_ = true;
+            self->tuning_active_ = false;
+        }
+    };
 
     // ROS2 components
     rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr sub_encoder_a_;
@@ -194,6 +268,8 @@ private:
         this->declare_parameter("motor_a.output_max", 200.0);
         this->declare_parameter("motor_a.deadband_pwm", 15.0);
         this->declare_parameter("motor_a.error_deadzone", 5.0);
+        this->declare_parameter("motor_a.deadband_blend", 10.0);
+        this->declare_parameter("motor_a.derivative_filter_alpha", 0.15);
 
         float kp_a = this->get_parameter("motor_a.Kp").as_double();
         float ki_a = this->get_parameter("motor_a.Ki").as_double();
@@ -203,6 +279,9 @@ private:
         pid_motor_a_.output_max = this->get_parameter("motor_a.output_max").as_double();
         pid_motor_a_.deadband_pwm = this->get_parameter("motor_a.deadband_pwm").as_double();
         pid_motor_a_.error_deadzone = this->get_parameter("motor_a.error_deadzone").as_double();
+        pid_motor_a_.deadband_blend = this->get_parameter("motor_a.deadband_blend").as_double();
+        pid_motor_a_.setDerivativeFilterAlpha(
+            this->get_parameter("motor_a.derivative_filter_alpha").as_double());
 
         RCLCPP_INFO(this->get_logger(), "Motor A: Kp=%.3f Ki=%.3f Kd=%.3f",
                     kp_a, ki_a, kd_a);
@@ -215,6 +294,8 @@ private:
         this->declare_parameter("motor_b.output_max", 200.0);
         this->declare_parameter("motor_b.deadband_pwm", 15.0);
         this->declare_parameter("motor_b.error_deadzone", 5.0);
+        this->declare_parameter("motor_b.deadband_blend", 10.0);
+        this->declare_parameter("motor_b.derivative_filter_alpha", 0.15);
 
         float kp_b = this->get_parameter("motor_b.Kp").as_double();
         float ki_b = this->get_parameter("motor_b.Ki").as_double();
@@ -224,15 +305,32 @@ private:
         pid_motor_b_.output_max = this->get_parameter("motor_b.output_max").as_double();
         pid_motor_b_.deadband_pwm = this->get_parameter("motor_b.deadband_pwm").as_double();
         pid_motor_b_.error_deadzone = this->get_parameter("motor_b.error_deadzone").as_double();
+        pid_motor_b_.deadband_blend = this->get_parameter("motor_b.deadband_blend").as_double();
+        pid_motor_b_.setDerivativeFilterAlpha(
+            this->get_parameter("motor_b.derivative_filter_alpha").as_double());
 
         RCLCPP_INFO(this->get_logger(), "Motor B: Kp=%.3f Ki=%.3f Kd=%.3f",
                     kp_b, ki_b, kd_b);
 
         // Control parameters
+        this->declare_parameter("control.ticks_per_revolution", 1980.0);
+        this->declare_parameter("control.max_rpm", 30.0);
+        ticks_per_revolution_ = this->get_parameter("control.ticks_per_revolution").as_double();
+        max_rpm_ = this->get_parameter("control.max_rpm").as_double();
+
         this->declare_parameter("control.velocity_filter_alpha", 0.2);
+        this->declare_parameter("control.velocity_min_ticks", 4.0);
+        this->declare_parameter("control.velocity_max_window", 0.2);
         float alpha = this->get_parameter("control.velocity_filter_alpha").as_double();
         filter_a_ = ExponentialFilter(alpha);
         filter_b_ = ExponentialFilter(alpha);
+
+        float min_ticks = this->get_parameter("control.velocity_min_ticks").as_double();
+        float max_window = this->get_parameter("control.velocity_max_window").as_double();
+        vel_est_a_.min_ticks = min_ticks;
+        vel_est_a_.max_window = max_window;
+        vel_est_b_.min_ticks = min_ticks;
+        vel_est_b_.max_window = max_window;
 
         // Auto-tuning parameters
         this->declare_parameter("auto_tune.Kp_start", 0.05);
@@ -246,16 +344,135 @@ private:
         Kp_max_ = this->get_parameter("auto_tune.Kp_max").as_double();
         test_duration_per_Kp_ = this->get_parameter("auto_tune.test_duration_per_Kp").as_double();
         settling_time_ = this->get_parameter("auto_tune.settling_time").as_double();
+
+        // Methode d'identification et formule de calcul des gains
+        this->declare_parameter("auto_tune.method", "relay");
+        this->declare_parameter("auto_tune.zn_variant", "no_overshoot");
+        this->declare_parameter("auto_tune.output_path",
+            "/home/ubuntu/ros2_ws/jerro/jerro_drivers/config/pid_gains.yaml");
+        this->declare_parameter("auto_tune.encoder_check_pwm", 200.0);
+        this->declare_parameter("auto_tune.min_target_rpm", 8.0);
+
+        tune_method_ = this->get_parameter("auto_tune.method").as_string();
+        std::string zn_name = this->get_parameter("auto_tune.zn_variant").as_string();
+        zn_variant_ = znVariantFromString(zn_name);
+        gains_output_path_ = this->get_parameter("auto_tune.output_path").as_string();
+        encoder_check_pwm_ = this->get_parameter("auto_tune.encoder_check_pwm").as_double();
+        min_target_rpm_ = this->get_parameter("auto_tune.min_target_rpm").as_double();
+
+        // Parametres du detecteur d'oscillation (chemin 'sweep').
+        // Ils existaient dans le YAML mais n'etaient ni declares ni lus :
+        // OscillationDetector etait instancie avec ses valeurs codees en dur.
+        this->declare_parameter("auto_tune.min_cycles_required", 4);
+        this->declare_parameter("auto_tune.period_tolerance", 0.30);
+        this->declare_parameter("auto_tune.min_extremum_amplitude", 20.0);
+        this->declare_parameter("auto_tune.min_period", 0.2);
+
+        detector_template_.min_cycles_required =
+            this->get_parameter("auto_tune.min_cycles_required").as_int();
+        detector_template_.period_tolerance =
+            this->get_parameter("auto_tune.period_tolerance").as_double();
+        detector_template_.min_extremum_amplitude =
+            this->get_parameter("auto_tune.min_extremum_amplitude").as_double();
+        detector_template_.min_period =
+            this->get_parameter("auto_tune.min_period").as_double();
+
+        // Parametres du relais (chemin 'relay')
+        this->declare_parameter("auto_tune.relay_amplitude", 40.0);
+        this->declare_parameter("auto_tune.relay_hysteresis", 10.0);
+        this->declare_parameter("auto_tune.relay_min_cycles", 5);
+        this->declare_parameter("auto_tune.relay_skip_cycles", 2);
+        this->declare_parameter("auto_tune.relay_bias_rate", 60.0);
+        this->declare_parameter("auto_tune.relay_noise_duration", 1.0);
+        this->declare_parameter("auto_tune.relay_bias_tolerance", 0.05);
+        this->declare_parameter("auto_tune.relay_bias_settle_time", 1.5);
+        this->declare_parameter("auto_tune.relay_hysteresis_max_ratio", 0.25);
+        this->declare_parameter("auto_tune.relay_max_switch_gap", 5.0);
+
+        relay_template_.relay_amplitude =
+            this->get_parameter("auto_tune.relay_amplitude").as_double();
+        relay_template_.min_hysteresis =
+            this->get_parameter("auto_tune.relay_hysteresis").as_double();
+        relay_template_.min_cycles =
+            this->get_parameter("auto_tune.relay_min_cycles").as_int();
+        relay_template_.skip_cycles =
+            this->get_parameter("auto_tune.relay_skip_cycles").as_int();
+        relay_template_.bias_rate =
+            this->get_parameter("auto_tune.relay_bias_rate").as_double();
+        relay_template_.noise_duration =
+            this->get_parameter("auto_tune.relay_noise_duration").as_double();
+        relay_template_.bias_tolerance =
+            this->get_parameter("auto_tune.relay_bias_tolerance").as_double();
+        relay_template_.bias_settle_time =
+            this->get_parameter("auto_tune.relay_bias_settle_time").as_double();
+        relay_template_.hysteresis_max_ratio =
+            this->get_parameter("auto_tune.relay_hysteresis_max_ratio").as_double();
+        relay_template_.max_switch_gap =
+            this->get_parameter("auto_tune.relay_max_switch_gap").as_double();
+        relay_template_.period_tolerance = detector_template_.period_tolerance;
+        relay_template_.bias_max = std::min(
+            static_cast<float>(pid_motor_a_.output_max),
+            255.0f - relay_template_.relay_amplitude);
+
+        RCLCPP_INFO(this->get_logger(), "Auto-tune: methode=%s, formule=%s",
+                    tune_method_.c_str(), znVariantName(zn_variant_));
+        RCLCPP_INFO(this->get_logger(), "Auto-tune: gains sauvegardes vers %s",
+                    gains_output_path_.c_str());
+    }
+
+    float ticksToRpm(float ticks_per_sec) const
+    {
+        if (ticks_per_revolution_ <= 0.0f) return 0.0f;
+        return ticks_per_sec * 60.0f / ticks_per_revolution_;
+    }
+
+    float rpmToTicks(float rpm) const
+    {
+        return rpm * ticks_per_revolution_ / 60.0f;
+    }
+
+    int64_t nowNanos() const
+    {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - node_start_time_).count();
+    }
+
+    // Temps monotone depuis le demarrage du noeud, en secondes.
+    float nowSeconds() const
+    {
+        return std::chrono::duration<float>(
+            std::chrono::steady_clock::now() - node_start_time_).count();
     }
 
     void encoderACallback(const std_msgs::msg::Int32::SharedPtr msg)
     {
         encoder_a_count_ = msg->data;
+        encoder_a_stamp_ns_ = nowNanos();
+        encoder_a_seq_.fetch_add(1);  // publie en dernier : count/stamp sont prets
     }
 
     void encoderBCallback(const std_msgs::msg::Int32::SharedPtr msg)
     {
         encoder_b_count_ = msg->data;
+        encoder_b_stamp_ns_ = nowNanos();
+        encoder_b_seq_.fetch_add(1);
+    }
+
+    uint32_t encoderSeq(int motor_num) const
+    {
+        return (motor_num == 1) ? encoder_a_seq_.load() : encoder_b_seq_.load();
+    }
+
+    int encoderCount(int motor_num) const
+    {
+        return (motor_num == 1) ? encoder_a_count_.load() : encoder_b_count_.load();
+    }
+
+    float encoderStamp(int motor_num) const
+    {
+        int64_t ns = (motor_num == 1) ? encoder_a_stamp_ns_.load()
+                                      : encoder_b_stamp_ns_.load();
+        return static_cast<float>(ns) * 1e-9f;
     }
 
     void motorSpeedCallback(const jerro_msgs::msg::MotorSpeed::SharedPtr msg)
@@ -267,15 +484,19 @@ private:
         }
 
         // Setpoint is in ticks/sec (encoder ticks per second)
-        // Typical range: 0-2500 ticks/sec (based on 158.2 PPR encoders, ~250 RPM max)
+        // La borne haute est derivee de control.ticks_per_revolution et
+        // control.max_rpm : elle suit automatiquement un changement de moteur.
         target_velocity_a_ = msg->motor_speed_a;
         target_velocity_b_ = msg->motor_speed_b;
 
         // Warn if setpoint seems unusually high
-        if (std::abs(target_velocity_a_) > 3000.0f || std::abs(target_velocity_b_) > 3000.0f) {
+        float max_ticks = rpmToTicks(max_rpm_);
+        if (std::abs(target_velocity_a_) > max_ticks || std::abs(target_velocity_b_) > max_ticks) {
             RCLCPP_WARN(this->get_logger(),
-                "High velocity setpoint: A=%.1f B=%.1f ticks/sec (max recommended: 2500)",
-                target_velocity_a_, target_velocity_b_);
+                "High velocity setpoint: A=%.1f B=%.1f ticks/sec (%.1f/%.1f RPM, max %.0f ticks/s = %.0f RPM)",
+                target_velocity_a_, target_velocity_b_,
+                ticksToRpm(target_velocity_a_), ticksToRpm(target_velocity_b_),
+                max_ticks, max_rpm_);
         }
 
         RCLCPP_DEBUG(this->get_logger(), "PID setpoint: A=%.1f B=%.1f ticks/sec",
@@ -300,6 +521,15 @@ private:
 
     void controlTimerCallback()
     {
+        // Pendant un auto-tune, le thread de tuning est seul proprietaire des
+        // moteurs et des objets PID. Sans ce garde, ce callback ecrirait
+        // setMotorPWM(x, 0) et pid.reset() toutes les 20 ms par-dessus la
+        // commande du tuning (target_velocity_ vaut 0 pendant l'identification),
+        // hachant le signal et corrompant l'etat du PID depuis un autre thread.
+        if (tuning_active_.load()) {
+            return;
+        }
+
         auto current_time = std::chrono::steady_clock::now();
 
         if (first_run_) {
@@ -322,11 +552,15 @@ private:
         int current_encoder_a = encoder_a_count_.load();
         int current_encoder_b = encoder_b_count_.load();
 
-        float velocity_raw_a = (current_encoder_a - last_encoder_a_) / dt;
-        float velocity_raw_b = (current_encoder_b - last_encoder_b_) / dt;
-
         last_encoder_a_ = current_encoder_a;
         last_encoder_b_ = current_encoder_b;
+
+        // Estimation a fenetre adaptative : a vitesse elevee la fenetre reste
+        // courte, a basse vitesse elle s'allonge pour recuperer de la resolution
+        // au lieu de sauter entre 0 et 1/dt ticks/s.
+        float t_now = nowSeconds();
+        float velocity_raw_a = vel_est_a_.update(current_encoder_a, t_now);
+        float velocity_raw_b = vel_est_b_.update(current_encoder_b, t_now);
 
         // Filter velocities
         float velocity_a = filter_a_.update(velocity_raw_a);
@@ -418,6 +652,17 @@ private:
         }
     }
 
+    // Arrete le mouvement sans couper le pont en H.
+    // A utiliser partout dans l'auto-tune : stopMotors() coupe l'alimentation du
+    // pont et rien ne la retablit (setupMotors() n'est appele que dans le
+    // constructeur), ce qui rendait les moteurs inutilisables jusqu'au
+    // redemarrage du noeud apres un echec de tuning.
+    void haltMotors()
+    {
+        setMotorPWM(1, 0.0f);
+        setMotorPWM(2, 0.0f);
+    }
+
     void stopMotors()
     {
         // Stop Hardware PWM (duty=0)
@@ -439,6 +684,22 @@ private:
     {
         (void)uuid;
         RCLCPP_INFO(this->get_logger(), "Received auto-tune request for motor(s) %d", goal->motor_select);
+
+        // Deux tunings simultanes se battraient pour les memes moteurs et les
+        // memes objets PID.
+        if (tuning_active_.load()) {
+            RCLCPP_WARN(this->get_logger(), "Auto-tune deja en cours, goal rejete");
+            return rclcpp_action::GoalResponse::REJECT;
+        }
+
+        if (goal->motor_select != AutoTunePID::Goal::MOTOR_A &&
+            goal->motor_select != AutoTunePID::Goal::MOTOR_B &&
+            goal->motor_select != AutoTunePID::Goal::BOTH_MOTORS) {
+            RCLCPP_WARN(this->get_logger(), "motor_select invalide: %d (attendu 1, 2 ou 3)",
+                        goal->motor_select);
+            return rclcpp_action::GoalResponse::REJECT;
+        }
+
         return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
     }
 
@@ -477,14 +738,59 @@ private:
         result->ki_b = 0;
         result->kd_b = 0;
 
+        // Prend possession des moteurs et fait taire la boucle 50 Hz jusqu'a la
+        // sortie de cette fonction, quel que soit le chemin emprunte.
+        TuningGuard guard(this);
+
         // Auto-tune based on motor selection
         bool tune_a = (goal->motor_select == AutoTunePID::Goal::MOTOR_A ||
                        goal->motor_select == AutoTunePID::Goal::BOTH_MOTORS);
         bool tune_b = (goal->motor_select == AutoTunePID::Goal::MOTOR_B ||
                        goal->motor_select == AutoTunePID::Goal::BOTH_MOTORS);
 
+        float target_velocity = goal->target_velocity;
+        if (target_velocity <= 0.0f) {
+            result->message = "target_velocity doit etre > 0 (recu " +
+                              std::to_string(target_velocity) + ")";
+            RCLCPP_ERROR(this->get_logger(), "%s", result->message.c_str());
+            goal_handle->abort(result);
+            return;
+        }
+
+        // Garde-fou de point de fonctionnement. Une consigne exprimee en ticks/s
+        // ne dit rien sur le regime physique vise : avec 1980 ticks/tour,
+        // 200 ticks/s valent 6.1 RPM, c'est-a-dire un rampement en plein
+        // frottement sec - le pire point pour identifier une dynamique.
+        float target_rpm = ticksToRpm(target_velocity);
+        RCLCPP_INFO(this->get_logger(),
+                    "Consigne d'identification: %.0f ticks/s = %.1f RPM (%.1f ticks/tour)",
+                    target_velocity, target_rpm, ticks_per_revolution_);
+
+        if (target_rpm < min_target_rpm_) {
+            char buf[256];
+            std::snprintf(buf, sizeof(buf),
+                "consigne trop basse: %.0f ticks/s = %.1f RPM, minimum %.1f RPM "
+                "(soit %.0f ticks/s). Identifier un moteur au ralenti donne un "
+                "resultat domine par le frottement sec, pas par sa dynamique",
+                target_velocity, target_rpm, min_target_rpm_, rpmToTicks(min_target_rpm_));
+            result->message = buf;
+            RCLCPP_ERROR(this->get_logger(), "%s", result->message.c_str());
+            goal_handle->abort(result);
+            return;
+        }
+
+        if (target_rpm > max_rpm_) {
+            RCLCPP_WARN(this->get_logger(),
+                "Consigne au-dela de la vitesse a vide (%.1f RPM > %.1f RPM): "
+                "le moteur risque de saturer avant d'osciller",
+                target_rpm, max_rpm_);
+        }
+
+        float max_duration = goal->max_duration > 0.0f ? goal->max_duration : 120.0f;
+
         float Ku_a = 0, Tu_a = 0;
         float Ku_b = 0, Tu_b = 0;
+        std::string failure;
 
         // Tune Motor A
         if (tune_a) {
@@ -495,7 +801,7 @@ private:
 
             encoder_a_count_ = 0;
             last_encoder_a_ = 0;
-            if (autoTuneMotor(1, goal->target_velocity, goal->max_duration, goal_handle, Ku_a, Tu_a)) {
+            if (tuneMotor(1, target_velocity, max_duration, goal_handle, Ku_a, Tu_a, failure)) {
                 result->ku_a = Ku_a;
                 result->tu_a = Tu_a;
                 result->kp_a = pid_motor_a_.Kp;
@@ -503,8 +809,9 @@ private:
                 result->kd_a = pid_motor_a_.Kd;
                 RCLCPP_INFO(this->get_logger(), "Motor A tuned: Ku=%.3f Tu=%.3f", Ku_a, Tu_a);
             } else {
-                result->message = "Failed to tune Motor A";
-                goal_handle->abort(result);
+                result->message = "Moteur A: " + failure;
+                RCLCPP_ERROR(this->get_logger(), "%s", result->message.c_str());
+                finishFailed(goal_handle, result);
                 return;
             }
         }
@@ -518,7 +825,7 @@ private:
 
             encoder_b_count_ = 0;
             last_encoder_b_ = 0;
-            if (autoTuneMotor(2, goal->target_velocity, goal->max_duration, goal_handle, Ku_b, Tu_b)) {
+            if (tuneMotor(2, target_velocity, max_duration, goal_handle, Ku_b, Tu_b, failure)) {
                 result->ku_b = Ku_b;
                 result->tu_b = Tu_b;
                 result->kp_b = pid_motor_b_.Kp;
@@ -526,21 +833,33 @@ private:
                 result->kd_b = pid_motor_b_.Kd;
                 RCLCPP_INFO(this->get_logger(), "Motor B tuned: Ku=%.3f Tu=%.3f", Ku_b, Tu_b);
             } else {
-                result->message = "Failed to tune Motor B";
-                goal_handle->abort(result);
+                result->message = "Moteur B: " + failure;
+                RCLCPP_ERROR(this->get_logger(), "%s", result->message.c_str());
+                finishFailed(goal_handle, result);
                 return;
             }
         }
 
-        // Save gains to YAML
-        std::string config_path = "/home/ubuntu/jerro_ws/src/jerro_drivers/config/pid_gains.yaml";
-        saveGainsToYAML(config_path,
-                        result->kp_a, result->ki_a, result->kd_a,
-                        result->kp_b, result->ki_b, result->kd_b);
+        // Sauvegarde. On ecrit les gains VIVANTS des deux PID, pas les champs du
+        // resultat : quand un seul moteur est tune, les champs de l'autre valent
+        // 0 et ecrasaient ses gains dans le fichier.
+        std::string save_error;
+        bool saved = saveGainsToYAML(gains_output_path_, save_error);
 
-        // Success!
         result->success = true;
-        result->message = "Auto-tuning completed successfully";
+        if (saved) {
+            result->message = "Auto-tuning termine, gains ecrits dans " + gains_output_path_ +
+                              " (colcon build requis pour les propager dans share/)";
+        } else {
+            // On ne pretend pas avoir sauvegarde : l'ancien code loggait l'echec
+            // et retournait quand meme success=true.
+            result->success = false;
+            result->message = "Auto-tuning reussi mais sauvegarde impossible: " + save_error;
+            RCLCPP_ERROR(this->get_logger(), "%s", result->message.c_str());
+            finishFailed(goal_handle, result);
+            return;
+        }
+
         feedback->status = "Auto-tuning completed";
         feedback->progress = 1.0;
         goal_handle->publish_feedback(feedback);
@@ -549,9 +868,193 @@ private:
         RCLCPP_INFO(this->get_logger(), "Auto-tuning completed successfully");
     }
 
+    // Termine le goal en distinguant annulation et echec, pour que l'appelant
+    // voie CANCELED plutot qu'ABORTED quand il a lui-meme annule.
+    void finishFailed(const std::shared_ptr<GoalHandleAutoTune>& goal_handle,
+                      std::shared_ptr<AutoTunePID::Result> result)
+    {
+        result->success = false;
+        if (goal_handle->is_canceling()) {
+            goal_handle->canceled(result);
+        } else {
+            goal_handle->abort(result);
+        }
+    }
+
+    // Aiguillage entre les deux methodes d'identification.
+    bool tuneMotor(int motor_num, float target_velocity, float max_duration,
+                   std::shared_ptr<GoalHandleAutoTune> goal_handle,
+                   float& Ku_out, float& Tu_out, std::string& failure)
+    {
+        // Verification materielle prealable : distingue en quelques secondes une
+        // panne (moteur, connecteur, encodeur) d'un probleme de reglage, au lieu
+        // d'attendre l'expiration du budget de temps.
+        if (!checkEncoderFeedback(motor_num, failure)) {
+            return false;
+        }
+
+        if (tune_method_ == "sweep") {
+            return autoTuneMotor(motor_num, target_velocity, max_duration,
+                                 goal_handle, Ku_out, Tu_out, failure);
+        }
+        return autoTuneRelay(motor_num, target_velocity, max_duration,
+                             goal_handle, Ku_out, Tu_out, failure);
+    }
+
+    // Applique un PWM connu et verifie que le compteur encodeur progresse.
+    bool checkEncoderFeedback(int motor_num, std::string& failure)
+    {
+        using namespace std::chrono;
+
+        auto readCount = [this](int m) {
+            return (m == 1) ? encoder_a_count_.load() : encoder_b_count_.load();
+        };
+
+        int start_count = readCount(motor_num);
+        setMotorPWM(motor_num, encoder_check_pwm_);
+        std::this_thread::sleep_for(1s);
+        int end_count = readCount(motor_num);
+        setMotorPWM(motor_num, 0.0f);
+        std::this_thread::sleep_for(300ms);
+
+        int delta = std::abs(end_count - start_count);
+        RCLCPP_INFO(this->get_logger(),
+                    "Verification encodeur moteur %d: %d ticks a PWM=%.0f",
+                    motor_num, delta, encoder_check_pwm_);
+
+        if (delta < 10) {
+            failure = "aucun retour encodeur (" + std::to_string(delta) +
+                      " ticks a PWM=" + std::to_string(static_cast<int>(encoder_check_pwm_)) +
+                      ") - verifier le cablage moteur/encodeur et l'alimentation du pont en H";
+            return false;
+        }
+        return true;
+    }
+
+    // Identification par retour a relais (Astrom-Hagglund).
+    bool autoTuneRelay(int motor_num, float target_velocity, float max_duration,
+                       std::shared_ptr<GoalHandleAutoTune> goal_handle,
+                       float& Ku_out, float& Tu_out, std::string& failure)
+    {
+        using namespace std::chrono;
+
+        PIDController* pid = (motor_num == 1) ? &pid_motor_a_ : &pid_motor_b_;
+        VelocityEstimator estimator;
+        estimator.min_ticks = vel_est_a_.min_ticks;
+        estimator.max_window = vel_est_a_.max_window;
+
+        RelayTuner tuner = relay_template_;
+        tuner.start(target_velocity);
+
+        RCLCPP_INFO(this->get_logger(),
+                    "Relais moteur %d: consigne=%.1f ticks/s, d=%.0f PWM",
+                    motor_num, target_velocity, tuner.relay_amplitude);
+
+        auto start_time = steady_clock::now();
+        auto last_feedback = start_time;
+        auto last_state = tuner.state();
+
+        uint32_t last_seq = encoderSeq(motor_num);
+        float last_sample_t = -1.0f;
+        float velocity = 0.0f;
+
+        while (rclcpp::ok()) {
+            if (goal_handle->is_canceling()) {
+                failure = "annule par l'utilisateur";
+                haltMotors();
+                return false;
+            }
+
+            auto current_time = steady_clock::now();
+            float elapsed = duration<float>(current_time - start_time).count();
+            if (elapsed > max_duration) {
+                tuner.timeout();
+                failure = tuner.message;
+                haltMotors();
+                return false;
+            }
+
+            // Un pas par message encodeur : sonder plus vite ne ferait que
+            // relire le meme compteur et fabriquer du bruit (aliasing).
+            uint32_t seq = encoderSeq(motor_num);
+            if (seq == last_seq) {
+                std::this_thread::sleep_for(2ms);
+                continue;
+            }
+            last_seq = seq;
+
+            int count = encoderCount(motor_num);
+            float sample_t = encoderStamp(motor_num);
+
+            if (last_sample_t < 0.0f) {
+                last_sample_t = sample_t;
+                estimator.update(count, sample_t);
+                continue;
+            }
+
+            float dt = sample_t - last_sample_t;
+            last_sample_t = sample_t;
+            if (dt <= 0.0f || dt > 0.5f) {
+                continue;  // horodatage aberrant (message perdu, reprise)
+            }
+
+            velocity = estimator.update(count, sample_t);
+
+            float pwm = tuner.update(velocity, dt);
+
+            if (tuner.state() == RelayTuner::State::DONE) {
+                haltMotors();
+                Ku_out = tuner.Ku;
+                Tu_out = tuner.Tu;
+                RCLCPP_INFO(this->get_logger(),
+                            "  Cycle limite: a=%.1f ticks/s, h=%.1f, bias=%.0f PWM",
+                            tuner.amplitude, tuner.hysteresis, tuner.bias);
+                RCLCPP_INFO(this->get_logger(), "  Ku = %.3f, Tu = %.3f s", Ku_out, Tu_out);
+                if (!tuner.note.empty()) {
+                    RCLCPP_WARN(this->get_logger(), "  %s", tuner.note.c_str());
+                }
+                pid->calculateZieglerNicholsGains(Ku_out, Tu_out, zn_variant_);
+                RCLCPP_INFO(this->get_logger(),
+                            "Motor %d tuned (%s): Kp=%.4f Ki=%.4f Kd=%.5f",
+                            motor_num, znVariantName(zn_variant_),
+                            pid->Kp, pid->Ki, pid->Kd);
+                return true;
+            }
+
+            if (tuner.state() == RelayTuner::State::FAILED) {
+                failure = tuner.message;
+                haltMotors();
+                return false;
+            }
+
+            setMotorPWM(motor_num, pwm);
+
+            // Feedback a ~2 Hz, et immediatement a chaque changement de phase
+            if (tuner.state() != last_state ||
+                duration<float>(current_time - last_feedback).count() > 0.5f) {
+                last_state = tuner.state();
+                last_feedback = current_time;
+
+                auto feedback = std::make_shared<AutoTunePID::Feedback>();
+                feedback->status = std::string("Relais [") + tuner.stateName() +
+                                   "] v=" + std::to_string(static_cast<int>(velocity)) +
+                                   " ticks/s, cycles=" + std::to_string(tuner.cyclesCollected());
+                feedback->current_kp = pid->Kp;
+                feedback->current_motor = motor_num;
+                feedback->progress = std::min(0.95f, elapsed / max_duration);
+                goal_handle->publish_feedback(feedback);
+            }
+
+        }
+
+        failure = "arret du noeud pendant l'identification";
+        haltMotors();
+        return false;
+    }
+
     bool autoTuneMotor(int motor_num, float target_velocity, float max_duration,
                        std::shared_ptr<GoalHandleAutoTune> goal_handle,
-                       float& Ku_out, float& Tu_out)
+                       float& Ku_out, float& Tu_out, std::string& failure)
     {
         using namespace std::chrono;
 
@@ -563,6 +1066,20 @@ private:
         float original_Ki = pid->Ki;
         float original_Kd = pid->Kd;
 
+        // Le budget de temps doit couvrir tout le balayage, sinon on echoue par
+        // expiration sans jamais atteindre Kp_max. On previent explicitement au
+        // lieu de laisser l'utilisateur decouvrir le probleme 100 s plus tard.
+        float steps = (Kp_max_ - Kp_start_) / Kp_increment_;
+        float needed = steps * test_duration_per_Kp_;
+        if (needed > max_duration) {
+            float reachable = Kp_start_ + Kp_increment_ * (max_duration / test_duration_per_Kp_);
+            RCLCPP_WARN(this->get_logger(),
+                "Budget insuffisant: le balayage Kp=%.2f..%.2f par pas de %.3f a %.1f s/palier "
+                "demande ~%.0f s, mais max_duration=%.0f s. Kp maximum atteignable: %.2f",
+                Kp_start_, Kp_max_, Kp_increment_, test_duration_per_Kp_,
+                needed, max_duration, reachable);
+        }
+
         // Initialize for pure proportional control
         pid->Ki = 0.0f;
         pid->Kd = 0.0f;
@@ -573,13 +1090,15 @@ private:
                     motor_num, target_velocity);
 
         auto start_time = steady_clock::now();
+        float best_amplitude = 0.0f;
 
         // Sweep Kp
         while (pid->Kp <= Kp_max_) {
             // Check for cancellation
             if (goal_handle->is_canceling()) {
+                failure = "annule par l'utilisateur";
                 pid->setGains(original_Kp, original_Ki, original_Kd);
-                stopMotors();
+                haltMotors();
                 return false;
             }
 
@@ -593,43 +1112,66 @@ private:
             feedback->progress = (pid->Kp - Kp_start_) / (Kp_max_ - Kp_start_);
             goal_handle->publish_feedback(feedback);
 
-            OscillationDetector detector;
+            OscillationDetector detector = detector_template_;
             pid->reset();
 
-            auto test_start = steady_clock::now();
-            auto last_time = test_start;
+            VelocityEstimator estimator;
+            estimator.min_ticks = vel_est_a_.min_ticks;
+            estimator.max_window = vel_est_a_.max_window;
 
-            int last_count = (motor_num == 1) ? encoder_a_count_.load() : encoder_b_count_.load();
-            ExponentialFilter filter(0.2f);
+            auto test_start = steady_clock::now();
+            uint32_t last_seq = encoderSeq(motor_num);
+            float last_sample_t = -1.0f;
 
             bool oscillation_found = false;
             float Tu_detected = 0;
+            float amp_min = 0.0f, amp_max = 0.0f;
+            bool amp_init = false;
 
             // Control loop for this Kp value
             while (rclcpp::ok()) {
                 auto current_time = steady_clock::now();
-                float elapsed = duration_cast<milliseconds>(current_time - test_start).count() / 1000.0f;
+                float elapsed = duration<float>(current_time - test_start).count();
 
                 // Check timeout
                 if (elapsed > test_duration_per_Kp_) {
-                    RCLCPP_INFO(this->get_logger(), "  No oscillation at Kp=%.3f", pid->Kp);
+                    RCLCPP_INFO(this->get_logger(),
+                                "  No oscillation at Kp=%.3f (amplitude erreur observee: %.1f ticks/s)",
+                                pid->Kp, amp_max - amp_min);
                     break;
                 }
 
-                // Calculate dt
-                float dt = duration_cast<milliseconds>(current_time - last_time).count() / 1000.0f;
-                last_time = current_time;
+                // Le budget global doit aussi etre verifie ICI : sinon on ne le
+                // teste qu'apres un palier complet et on depasse largement.
+                if (duration<float>(current_time - start_time).count() > max_duration) {
+                    break;
+                }
 
-                if (dt < 0.001f || dt > 1.0f) {
-                    std::this_thread::sleep_for(10ms);
+                // Un pas par message encodeur (cf. aliasing, meme raison que
+                // dans autoTuneRelay).
+                uint32_t seq = encoderSeq(motor_num);
+                if (seq == last_seq) {
+                    std::this_thread::sleep_for(2ms);
+                    continue;
+                }
+                last_seq = seq;
+
+                int current_count = encoderCount(motor_num);
+                float sample_t = encoderStamp(motor_num);
+
+                if (last_sample_t < 0.0f) {
+                    last_sample_t = sample_t;
+                    estimator.update(current_count, sample_t);
                     continue;
                 }
 
-                // Measure velocity
-                int current_count = (motor_num == 1) ? encoder_a_count_.load() : encoder_b_count_.load();
-                float velocity_raw = (current_count - last_count) / dt;
-                last_count = current_count;
-                float velocity = filter.update(velocity_raw);
+                float dt = sample_t - last_sample_t;
+                last_sample_t = sample_t;
+                if (dt <= 0.0f || dt > 0.5f) {
+                    continue;
+                }
+
+                float velocity = estimator.update(current_count, sample_t);
 
                 // Compute PID
                 float pwm = pid->compute(target_velocity, velocity, dt);
@@ -637,6 +1179,13 @@ private:
 
                 // Detect oscillation (after settling)
                 if (elapsed > settling_time_) {
+                    if (!amp_init) {
+                        amp_min = amp_max = pid->raw_error;
+                        amp_init = true;
+                    }
+                    amp_min = std::min(amp_min, pid->raw_error);
+                    amp_max = std::max(amp_max, pid->raw_error);
+
                     if (detector.detectOscillation(pid->raw_error, dt, Tu_detected)) {
                         oscillation_found = true;
                         Ku_out = pid->Kp;
@@ -648,18 +1197,21 @@ private:
                     }
                 }
 
-                std::this_thread::sleep_for(20ms);
             }
+
+            best_amplitude = std::max(best_amplitude, amp_max - amp_min);
 
             // Stop motor
             setMotorPWM(motor_num, 0);
             std::this_thread::sleep_for(500ms);
 
             if (oscillation_found) {
-                // Success! Calculate Ziegler-Nichols gains
-                pid->calculateZieglerNicholsGains(Ku_out, Tu_out);
-                RCLCPP_INFO(this->get_logger(), "Motor %d tuned: Kp=%.3f Ki=%.3f Kd=%.3f",
-                            motor_num, pid->Kp, pid->Ki, pid->Kd);
+                // Success! Calculate gains from Ku/Tu
+                pid->calculateZieglerNicholsGains(Ku_out, Tu_out, zn_variant_);
+                RCLCPP_INFO(this->get_logger(),
+                            "Motor %d tuned (%s): Kp=%.4f Ki=%.4f Kd=%.5f",
+                            motor_num, znVariantName(zn_variant_),
+                            pid->Kp, pid->Ki, pid->Kd);
                 return true;
             }
 
@@ -667,48 +1219,69 @@ private:
             pid->Kp += Kp_increment_;
 
             // Check global timeout
-            float total_elapsed = duration_cast<seconds>(steady_clock::now() - start_time).count();
+            float total_elapsed = duration<float>(steady_clock::now() - start_time).count();
             if (total_elapsed > max_duration) {
-                RCLCPP_ERROR(this->get_logger(), "Auto-tuning timeout");
+                char buf[256];
+                std::snprintf(buf, sizeof(buf),
+                    "timeout: budget de %.0f s epuise, atteint Kp=%.2f sur Kp_max=%.2f "
+                    "(amplitude d'erreur max observee: %.1f ticks/s). "
+                    "Augmenter max_duration a ~%.0f s ou utiliser auto_tune.method=relay",
+                    max_duration, pid->Kp, Kp_max_, best_amplitude, needed);
+                failure = buf;
                 pid->setGains(original_Kp, original_Ki, original_Kd);
-                stopMotors();
+                haltMotors();
                 return false;
             }
         }
 
         // Failed to find oscillation
-        RCLCPP_ERROR(this->get_logger(), "Failed to find oscillation for motor %d", motor_num);
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+            "Kp_max=%.2f atteint sans oscillation soutenue "
+            "(amplitude d'erreur max observee: %.1f ticks/s, seuil de detection: %.1f). "
+            "Augmenter Kp_max, ou baisser auto_tune.min_extremum_amplitude",
+            Kp_max_, best_amplitude, detector_template_.min_extremum_amplitude);
+        failure = buf;
         pid->setGains(original_Kp, original_Ki, original_Kd);
-        stopMotors();
+        haltMotors();
         return false;
     }
 
-    void saveGainsToYAML(const std::string& filepath,
-                         float Kp_a, float Ki_a, float Kd_a,
-                         float Kp_b, float Ki_b, float Kd_b)
+    // Ecrit les gains actuellement actifs des DEUX moteurs. Utiliser l'etat vivant
+    // des PID (et non les champs du resultat) evite d'ecraser par des zeros les
+    // gains du moteur qui n'a pas ete tune lors de cet appel.
+    bool saveGainsToYAML(const std::string& filepath, std::string& error)
     {
         std::ofstream file(filepath);
         if (!file.is_open()) {
+            error = "ouverture impossible de " + filepath;
             RCLCPP_ERROR(this->get_logger(), "Failed to open %s for writing", filepath.c_str());
-            return;
+            return false;
         }
 
         file << std::fixed << std::setprecision(6);
         file << "# Auto-tuned PID gains\n";
-        file << "# Generated by motor_pid_controller auto-tune action\n\n";
+        file << "# Generated by motor_pid_controller auto-tune action\n";
+        file << "# methode: " << tune_method_ << ", formule: " << znVariantName(zn_variant_) << "\n\n";
         file << "motor_pid_controller:\n";
         file << "  ros__parameters:\n";
         file << "    motor_a:\n";
-        file << "      Kp: " << Kp_a << "\n";
-        file << "      Ki: " << Ki_a << "\n";
-        file << "      Kd: " << Kd_a << "\n";
+        file << "      Kp: " << pid_motor_a_.Kp << "\n";
+        file << "      Ki: " << pid_motor_a_.Ki << "\n";
+        file << "      Kd: " << pid_motor_a_.Kd << "\n";
         file << "    motor_b:\n";
-        file << "      Kp: " << Kp_b << "\n";
-        file << "      Ki: " << Ki_b << "\n";
-        file << "      Kd: " << Kd_b << "\n";
+        file << "      Kp: " << pid_motor_b_.Kp << "\n";
+        file << "      Ki: " << pid_motor_b_.Ki << "\n";
+        file << "      Kd: " << pid_motor_b_.Kd << "\n";
 
         file.close();
+        if (file.fail()) {
+            error = "erreur d'ecriture dans " + filepath;
+            return false;
+        }
+
         RCLCPP_INFO(this->get_logger(), "Saved tuned gains to %s", filepath.c_str());
+        return true;
     }
 };
 

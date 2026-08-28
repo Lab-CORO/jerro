@@ -1,26 +1,67 @@
+# Reglages du moteur / PID.
+#
+# ECHELLE : toutes les vitesses sont en TICKS/S. Elles dependent donc de la
+# resolution de l'encodeur.
+#
+# Resolution MESUREE (19794 ticks sur 10 tours) : 1979.4 ~ 1980 ticks/tour, soit
+#   11 PPR (rotor) x 4 (quadrature) x 45:1 (reducteur) = 1980
+# Le reducteur reel est donc 45:1 et non le 1:75 de la fiche produit. Recoupement :
+# 1360 RPM rotor / 45 = 30 RPM en sortie, ce qui correspond a la vitesse observee
+# (374 ticks/s a 36% de rapport cyclique -> ~31 RPM extrapole a pleine commande).
+# La mention "No-Load Speed: 100 RPM" de la fiche est donc erronee.
+#
+# Ancienne resolution : 632.8 ticks/tour  ->  k = 1980 / 632.8 = 3.129
+# Chaque valeur heritee de l'ancien moteur est mise a l'echelle par ce facteur,
+# indique en commentaire : les seuils se multiplient par k, les gains se divisent.
+
+encoder_publisher:
+  ros__parameters:
+    encoder:
+      # Filtre anti-rebond pigpio, en microsecondes. Plafonne le comptage a
+      # ~2/filtre ticks/s. L'ancienne valeur de 1000 us bornait a ~2000 ticks/s,
+      # ce qui ecretait silencieusement des ~36 RPM avec cet encodeur.
+      # 50 us -> plafond ~40000 ticks/s, soit ~730 RPM. Remonter si du bruit
+      # electrique fait deriver le comptage a l'arret.
+      glitch_filter_us: 50
+
 motor_pid_controller:
   ros__parameters:
     # Gains PID - Moteur A
+    # Anciens gains actifs / k : 0.156 / 0.5365 / 0.01134  (k = 3.129)
+    # Kp est en PWM/(tick/s) : avec 5.2x plus de ticks pour la meme vitesse
+    # physique, les anciens gains agissaient 5.2x trop fort.
+    # POINT DE DEPART seulement - ils encodaient aussi la dynamique de l'ANCIEN
+    # moteur (reducteur, inertie, couple differents).
     motor_a:
-      Kp: 0.1560000
-      Ki: 0.53654
-      Kd: 0.011
+      Kp: 0.0499
+      Ki: 0.1715
+      Kd: 0.00362
       integral_max: 150.0
       output_max: 240.0
-      deadband_pwm: 15.0
+      deadband_pwm: 20.0
       error_deadzone: 2.0
+      # Largeur (en PWM) sur laquelle la compensation de zone morte monte
+      # progressivement de 0 a deadband_pwm. Evite le saut discontinu au passage
+      # par zero, qui transforme le PID en controleur a relais et genere un cycle
+      # limite a basse vitesse. Mettre a 0.0 retablit l'ancien comportement.
+      deadband_blend: 12.0
+      # Filtrage passe-bas du terme derive. Plus bas = plus filtre.
+      derivative_filter_alpha: 0.15
 
     # Gains PID - Moteur B
+    # Anciens gains actifs / k : 0.156 / 0.4908 / 0.01240  (k = 3.129)
     motor_b:
-      Kp: 0.156
-      Ki: 0.490
-      Kd: 0.0123
+      Kp: 0.0499
+      Ki: 0.1568
+      Kd: 0.00396
       integral_max: 150.0
       output_max: 240.0
-      deadband_pwm: 15.0
+      deadband_pwm: 20.0
       error_deadzone: 2.0
+      deadband_blend: 12.0
+      derivative_filter_alpha: 0.15
 
-    # Configuration matériel
+    # Configuration materiel
     hardware:
       pwm_frequency: 100000
       motor_a_dir_pin: 5
@@ -28,13 +69,89 @@ motor_pid_controller:
       motor_b_dir_pin: 6
       motor_b_en_pin: 13
 
-    # Paramètres contrôle
+    # Parametres controle
     control:
       update_rate: 50
       velocity_filter_alpha: 0.3
 
-    # Auto-tuning (sera utilisé dans Phase 5)
+      # Resolution de l'encodeur, en ticks par tour de l'arbre de SORTIE,
+      # en quadrature complete (4 fronts par cycle - ce que compte
+      # encoder_publisher). Ne sert pas au calcul de la commande, mais derive
+      # les bornes de consigne et l'affichage en RPM.
+      #   11 PPR x 4 x 45:1 = 1980   (mesure : 19794 ticks / 10 tours)
+      ticks_per_revolution: 1980.0
+      # Vitesse max en sortie, deduite de 1360 RPM rotor / 45 et recoupee par la
+      # mesure. Borne haute des consignes : 30 RPM -> 990 ticks/s.
+      # A confirmer empiriquement (PWM 255, lire les ticks/s atteints).
+      max_rpm: 30.0
+
+      # Estimation de vitesse a fenetre adaptative : la fenetre s'elargit
+      # jusqu'a contenir velocity_min_ticks ticks, sans depasser
+      # velocity_max_window. Inchanges : ce sont des grandeurs en ticks et en
+      # secondes, et avec 5.2x plus de ticks la fenetre se raccourcit d'elle-meme.
+      velocity_min_ticks: 4.0
+      velocity_max_window: 0.2
+
+    # Auto-tuning
     auto_tune:
+      # "relay"  : retour a relais (Astrom-Hagglund) - force l'oscillation.
+      # "sweep"  : ancien balayage de Kp - fallback, tres lent.
+      method: "relay"
+
+      # Formule de calcul des gains a partir de Ku/Tu :
+      #   classic       : 0.6 Ku  - vise une decroissance au quart d'amplitude,
+      #                   donc une reponse VOLONTAIREMENT oscillante.
+      #   no_overshoot  : 0.2 Ku  - recommande pour une boucle de vitesse.
+      #   pessen        : 0.7 Ku  - plus agressif que classic.
+      #   tyreus_luyben : 0.45 Ku - compromis robuste.
+      zn_variant: "no_overshoot"
+
+      # Chemin d'ecriture des gains trouves. Doit pointer vers le fichier SOURCE.
+      # motor_control.launch.py relit pid_gains.yaml depuis share/, donc un
+      # colcon build est necessaire pour que les gains prennent effet ensuite.
+      output_path: "/home/ubuntu/ros2_ws/src/jerro/jerro_drivers/config/pid_gains.yaml"
+
+      # Verification materielle prealable : PWM applique ~1 s pour confirmer que
+      # l'encodeur repond avant de lancer l'identification.
+      encoder_check_pwm: 200.0
+
+      # Plancher de point de fonctionnement, en RPM. Identifier un moteur au
+      # ralenti donne un resultat domine par le frottement sec, pas par sa
+      # dynamique. 8 RPM = 264 ticks/s.
+      # Consigne conseillee : ~15 RPM = 495 ticks/s, soit 50% de la vitesse max,
+      # ce qui laisse de la marge au relais pour osciller sans saturer.
+      min_target_rpm: 8.0
+
+      # --- Parametres du relais (method: "relay") ---
+      # d : amplitude PWM de la commutation autour du biais. Trop faible -> pas de
+      # cycle limite franc ; trop eleve -> saturation et Ku sous-estime.
+      relay_amplitude: 40.0
+      # Hysteresis minimale (ticks/s) ; la valeur retenue est
+      # max(3 * sigma_bruit_mesure, cette valeur).   10.0 x k = 31.3
+      relay_hysteresis: 31.3
+      relay_min_cycles: 5
+      relay_skip_cycles: 2
+      relay_noise_duration: 1.0
+
+      # Recherche du biais : le PWM converge sur l'erreur de vitesse
+      #   bias += relay_bias_rate * (erreur/consigne) * dt
+      # puis est fige quand |erreur|/consigne reste sous relay_bias_tolerance
+      # pendant relay_bias_settle_time. Remplace l'ancienne rampe, qui s'arretait
+      # au premier franchissement de la consigne et depassait donc largement
+      # (biais donnant 374 ticks/s pour une consigne de 200).
+      relay_bias_rate: 60.0
+      relay_bias_tolerance: 0.05
+      relay_bias_settle_time: 1.5
+
+      # Plafond de l'hysteresis, en fraction de la consigne. Sans lui, une mesure
+      # bruitee donne h = 3*sigma superieur a la consigne : le relais ne peut plus
+      # commuter et l'identification tourne dans le vide jusqu'au timeout.
+      relay_hysteresis_max_ratio: 0.25
+
+      # Abandon anticipe si le relais ne commute plus pendant ce delai (s).
+      relay_max_switch_gap: 5.0
+
+      # --- Parametres du balayage (method: "sweep") ---
       Kp_start: 0.1
       Kp_increment: 0.02
       Kp_max: 2.0
@@ -42,5 +159,6 @@ motor_pid_controller:
       settling_time: 2.0
       min_cycles_required: 4
       period_tolerance: 0.30
-      min_extremum_amplitude: 15.0
+      # Amplitude minimale pour retenir un extremum (ticks/s).  15.0 x k = 46.9
+      min_extremum_amplitude: 46.9
       min_period: 0.3

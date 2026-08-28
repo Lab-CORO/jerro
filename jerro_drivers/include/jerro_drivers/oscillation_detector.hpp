@@ -60,10 +60,10 @@ struct OscillationDetector {
                     extremum_values.push_back(last_error);
                     last_was_peak = is_peak;
 
-                    // Besoin d'au moins 9 extrema pour 4 cycles complets
-                    // 1 cycle = pic → vallée → pic (3 extrema)
-                    // 4 cycles = 9 extrema
-                    if (extremum_times.size() >= 9) {
+                    // N cycles complets = 2N+1 extrema
+                    // (1 cycle = pic → vallée → pic)
+                    if (static_cast<int>(extremum_times.size()) >=
+                        2 * min_cycles_required + 1) {
                         if (isOscillationSustained(Tu_out)) {
                             return true;
                         }
@@ -86,11 +86,11 @@ struct OscillationDetector {
             periods.push_back(extremum_times[i] - extremum_times[i-2]);
         }
 
-        if (periods.size() < 4) return false;
+        if (static_cast<int>(periods.size()) < min_cycles_required) return false;
 
-        // Prend les 4 dernières périodes
+        // Prend les min_cycles_required dernières périodes
         std::vector<float> recent_periods(
-            periods.end() - 4,
+            periods.end() - min_cycles_required,
             periods.end()
         );
 
