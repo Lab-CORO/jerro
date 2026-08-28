@@ -22,6 +22,19 @@ public:
     EncoderPublisher()
     : Node("encoder_publisher")
     {
+        // Filtre anti-rebond pigpio, en microsecondes.
+        // Un front n'est compte que si le niveau est reste stable pendant cette
+        // duree, ce qui borne la frequence comptable a 1/(2*filtre) par voie,
+        // soit un plafond de 2/filtre ticks/s en quadrature complete.
+        //   1000 us -> ~2000 ticks/s  : suffisait a 632.8 ticks/tour, mais ecrete
+        //                               des ~60 RPM avec l'encodeur actuel
+        //                               (1980 ticks/tour, max ~30 RPM) - les
+        //                               comptes etaient perdus silencieusement
+        //     50 us -> ~40000 ticks/s : large marge, tout en filtrant les rebonds
+        //                               reels (de l'ordre de la microseconde)
+        this->declare_parameter("encoder.glitch_filter_us", 50);
+        glitch_filter_us_ = this->get_parameter("encoder.glitch_filter_us").as_int();
+
         // Initialize hardware
         initPigpio();
         setupEncoders();
@@ -35,6 +48,10 @@ public:
             20ms, std::bind(&EncoderPublisher::timerCallback, this));
 
         RCLCPP_INFO(this->get_logger(), "Encoder publisher initialized");
+        RCLCPP_INFO(this->get_logger(),
+                    "  - Filtre anti-rebond: %d us (plafond ~%d ticks/s)",
+                    glitch_filter_us_,
+                    glitch_filter_us_ > 0 ? 2000000 / glitch_filter_us_ : 0);
     }
 
     ~EncoderPublisher()
@@ -47,6 +64,7 @@ public:
 private:
     // Hardware management
     int pi_;
+    int glitch_filter_us_ = 50;
 
     // GPIO pins
     static constexpr int S1A = 23;
@@ -84,16 +102,16 @@ private:
         set_mode(pi_, S1B, PI_INPUT);
         set_pull_up_down(pi_, S1A, PI_PUD_UP);
         set_pull_up_down(pi_, S1B, PI_PUD_UP);
-        set_glitch_filter(pi_, S1A, 1000);
-        set_glitch_filter(pi_, S1B, 1000);
+        set_glitch_filter(pi_, S1A, glitch_filter_us_);
+        set_glitch_filter(pi_, S1B, glitch_filter_us_);
 
         // Configure Motor B encoder pins
         set_mode(pi_, S2A, PI_INPUT);
         set_mode(pi_, S2B, PI_INPUT);
         set_pull_up_down(pi_, S2A, PI_PUD_UP);
         set_pull_up_down(pi_, S2B, PI_PUD_UP);
-        set_glitch_filter(pi_, S2A, 1000);
-        set_glitch_filter(pi_, S2B, 1000);
+        set_glitch_filter(pi_, S2A, glitch_filter_us_);
+        set_glitch_filter(pi_, S2B, glitch_filter_us_);
 
         // Read initial state
         lev_a1_ = gpio_read(pi_, S1A);

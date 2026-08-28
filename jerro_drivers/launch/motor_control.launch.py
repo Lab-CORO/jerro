@@ -31,7 +31,9 @@ def generate_launch_description():
         executable='encoder_publisher',
         name='encoder_publisher',
         output='screen',
-        parameters=[{'use_sim_time': use_sim_time}]
+        # Le fichier de config porte aussi la section encoder_publisher
+        # (filtre anti-rebond), pas seulement les gains PID.
+        parameters=[motor_config_file, {'use_sim_time': use_sim_time}]
     )
 
     # Motor PID controller node
