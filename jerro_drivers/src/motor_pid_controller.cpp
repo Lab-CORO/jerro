@@ -386,6 +386,7 @@ private:
         this->declare_parameter("auto_tune.relay_noise_duration", 1.0);
         this->declare_parameter("auto_tune.relay_bias_tolerance", 0.05);
         this->declare_parameter("auto_tune.relay_bias_settle_time", 1.5);
+        this->declare_parameter("auto_tune.relay_bias_filter_tc", 0.5);
         this->declare_parameter("auto_tune.relay_hysteresis_max_ratio", 0.25);
         this->declare_parameter("auto_tune.relay_max_switch_gap", 5.0);
 
@@ -405,6 +406,8 @@ private:
             this->get_parameter("auto_tune.relay_bias_tolerance").as_double();
         relay_template_.bias_settle_time =
             this->get_parameter("auto_tune.relay_bias_settle_time").as_double();
+        relay_template_.bias_filter_tc =
+            this->get_parameter("auto_tune.relay_bias_filter_tc").as_double();
         relay_template_.hysteresis_max_ratio =
             this->get_parameter("auto_tune.relay_hysteresis_max_ratio").as_double();
         relay_template_.max_switch_gap =

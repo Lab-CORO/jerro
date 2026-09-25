@@ -52,6 +52,12 @@ public:
     float bias_max = 220.0f;         // Saturation de la recherche de biais
     float bias_tolerance = 0.05f;    // |erreur|/consigne acceptee pour "converge"
     float bias_settle_time = 1.5f;   // Duree de stabilite exigee avant de figer
+    // Constante de temps du filtre applique a la vitesse AVANT le test de
+    // convergence du biais. La mesure instantanee est bruitee (fenetre
+    // d'estimation courte) : sans filtre, |erreur|/consigne repasse au-dessus de
+    // bias_tolerance a chaque echantillon et le biais n'est jamais fige, meme
+    // lorsqu'il est correct en moyenne.
+    float bias_filter_tc = 0.5f;
     float noise_duration = 1.0f;     // Duree de la mesure de bruit (s)
 
     // Plafond de l'hysteresis, en fraction de la consigne. Sans lui, une mesure
@@ -88,6 +94,8 @@ public:
         noise_sum_ = noise_sum_sq_ = 0.0f;
         noise_n_ = 0;
         in_tolerance_since_ = -1.0f;
+        bias_vel_filt_ = 0.0f;
+        have_bias_filt_ = false;
         have_last_switch_ = false;
         last_switch_t_ = 0.0f;
         last_cycle_t_ = 0.0f;
@@ -162,6 +170,8 @@ private:
     float last_velocity_ = 0.0f;
 
     float in_tolerance_since_ = -1.0f;
+    float bias_vel_filt_ = 0.0f;
+    bool have_bias_filt_ = false;
 
     float noise_sum_ = 0.0f;
     float noise_sum_sq_ = 0.0f;
@@ -208,6 +218,17 @@ private:
         if (rel_err < -1.0f) rel_err = -1.0f;
 
         bias += bias_rate * rel_err * dt;
+
+        // Le test de convergence porte sur la vitesse filtree, pas sur la mesure
+        // brute : c'est la moyenne qui doit etre a la consigne.
+        if (!have_bias_filt_) {
+            bias_vel_filt_ = velocity;
+            have_bias_filt_ = true;
+        } else {
+            float a = (bias_filter_tc > 0.0f) ? (dt / (bias_filter_tc + dt)) : 1.0f;
+            bias_vel_filt_ += a * (velocity - bias_vel_filt_);
+        }
+        float rel_err_filt = (target_ - bias_vel_filt_) / target_;
         if (bias < 0.0f) bias = 0.0f;
 
         if (bias >= bias_max) {
@@ -218,7 +239,7 @@ private:
             return 0.0f;
         }
 
-        if (std::abs(rel_err) <= bias_tolerance) {
+        if (std::abs(rel_err_filt) <= bias_tolerance) {
             if (in_tolerance_since_ < 0.0f) in_tolerance_since_ = t_;
             if (t_ - in_tolerance_since_ >= bias_settle_time) {
                 freezeBias();

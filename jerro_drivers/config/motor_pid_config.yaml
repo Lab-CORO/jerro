@@ -36,7 +36,16 @@ motor_pid_controller:
       Kp: 0.0499
       Ki: 0.1715
       Kd: 0.00362
-      integral_max: 150.0
+      # BORNE D'AUTORITE DE L'INTEGRALE, pas seulement un anti-windup.
+      # Le terme integral vaut Ki * integral, et integral est ecrete a
+      # integral_max : la contribution integrale ne peut donc jamais depasser
+      # Ki * integral_max en PWM. A dimensionner sur output_max / Ki, sinon le
+      # regime etabli est inatteignable en haut de plage.
+      #   Avec l'ancien 150.0 et Ki = 0.611, le plafond etait 92 PWM alors qu'il
+      #   faut ~200 PWM pour tenir 3000 ticks/s : erreur statique de 15% mesuree.
+      # A RECALCULER apres chaque auto-tune, car Ki change.
+      #   output_max / Ki = 240 / 0.611 = 393  ->  390.0
+      integral_max: 390.0
       output_max: 240.0
       deadband_pwm: 20.0
       error_deadzone: 2.0
@@ -54,7 +63,8 @@ motor_pid_controller:
       Kp: 0.0499
       Ki: 0.1568
       Kd: 0.00396
-      integral_max: 150.0
+      # Meme dimensionnement que motor_a : output_max / Ki = 240 / 0.698 = 344.
+      integral_max: 345.0
       output_max: 240.0
       deadband_pwm: 20.0
       error_deadzone: 2.0
@@ -80,10 +90,24 @@ motor_pid_controller:
       # les bornes de consigne et l'affichage en RPM.
       #   11 PPR x 4 x 45:1 = 1980   (mesure : 19794 ticks / 10 tours)
       ticks_per_revolution: 1980.0
-      # Vitesse max en sortie, deduite de 1360 RPM rotor / 45 et recoupee par la
-      # mesure. Borne haute des consignes : 30 RPM -> 990 ticks/s.
-      # A confirmer empiriquement (PWM 255, lire les ticks/s atteints).
-      max_rpm: 30.0
+      # Vitesse max en sortie, MESUREE en PWM direct (balayage a vide) :
+      #   PWM 150 -> 2693 / 2781 ticks/s  (81.6 / 84.3 RPM)
+      #   PWM 200 -> 3111 / 3128 ticks/s  (94.3 / 94.8 RPM)
+      #   PWM 255 -> 3656 / 3632 ticks/s  (110.8 / 110.1 RPM)
+      # Avec output_max = 240 le maximum exploitable est ~105 RPM = 3465 ticks/s,
+      # soit ~0.35 m/s pour une roue de 32.5 mm de rayon.
+      #
+      # L'ancienne valeur de 30.0 etait FAUSSE d'un facteur 3.7. Elle etait
+      # deduite d'un point a "374 ticks/s a 36% de rapport cyclique", que le
+      # balayage ci-dessus contredit. Consequences observees :
+      #   - une consigne de 0.5 m/s (4848 ticks/s) est hors d'atteinte, le PID
+      #     sature a output_max et laisse une erreur statique de ~0.15 m/s que
+      #     l'integrateur ne peut pas rattraper ;
+      #   - le point de fonctionnement "50% du max" conseille pour l'auto-tune
+      #     valait 495 ticks/s, soit en realite 14% du max.
+      # Le "No-Load Speed: 100 RPM" de la fiche produit est donc correct ; c'est
+      # la deduction 1360 RPM rotor / 45:1 qui ne tient pas.
+      max_rpm: 105.0
 
       # Estimation de vitesse a fenetre adaptative : la fenetre s'elargit
       # jusqu'a contenir velocity_min_ticks ticks, sans depasser
@@ -118,8 +142,10 @@ motor_pid_controller:
       # Plancher de point de fonctionnement, en RPM. Identifier un moteur au
       # ralenti donne un resultat domine par le frottement sec, pas par sa
       # dynamique. 8 RPM = 264 ticks/s.
-      # Consigne conseillee : ~15 RPM = 495 ticks/s, soit 50% de la vitesse max,
-      # ce qui laisse de la marge au relais pour osciller sans saturer.
+      # Consigne conseillee : ~50 RPM = 1650 ticks/s, soit 50% de la vitesse max
+      # reelle (105 RPM), ce qui laisse de la marge au relais pour osciller sans
+      # saturer. Identifier a 495 ticks/s revient a identifier a 14% du max, dans
+      # un regime domine par le frottement.
       min_target_rpm: 8.0
 
       # --- Parametres du relais (method: "relay") ---
@@ -142,6 +168,12 @@ motor_pid_controller:
       relay_bias_rate: 60.0
       relay_bias_tolerance: 0.05
       relay_bias_settle_time: 1.5
+      # La convergence est jugee sur la vitesse FILTREE (constante de temps
+      # ci-dessous). La mesure brute oscille de +/-10% autour de la consigne a
+      # cause de la fenetre d'estimation courte : testee telle quelle, elle ne
+      # tient jamais 1.5 s sous 5% et la recherche de biais part en timeout alors
+      # que le biais est correct en moyenne.
+      relay_bias_filter_tc: 0.5
 
       # Plafond de l'hysteresis, en fraction de la consigne. Sans lui, une mesure
       # bruitee donne h = 3*sigma superieur a la consigne : le relais ne peut plus
